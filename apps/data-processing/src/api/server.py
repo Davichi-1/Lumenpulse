@@ -23,9 +23,16 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from sentiment import SentimentAnalyzer
+from vaderSentiment.vaderSentiment import BOOSTER_DICT, NEGATE
 from src.config.latency_budget import record_latency
 from src.utils.logger import setup_logger, correlation_id_ctx, generate_correlation_id
-from src.utils.metrics import API_FAILURES_TOTAL, generate_latest, CONTENT_TYPE_LATEST
+from src.utils.metrics import (
+    API_FAILURES_TOTAL,
+    INFERENCE_OOD_TOTAL,
+    INFERENCE_REQUESTS_TOTAL,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
 from src.security import (
     security_config,
     setup_security_middleware,
@@ -33,6 +40,7 @@ from src.security import (
     get_rate_limit_decorator,
 )
 from src.ml.retraining_pipeline import run_retraining, get_last_run_status
+from src.ml.ood_detector import LexicalOODDetector, configured_unknown_token_ratio
 from src.ml.model_registry import (
     get_registry_status,
     # Shadow-mode deployment (Issue #1256)
@@ -139,6 +147,14 @@ async def metrics_and_logging_middleware(request: Request, call_next):
 
 # Initialize your existing SentimentAnalyzer
 sentiment_analyzer = SentimentAnalyzer()
+ood_detector = LexicalOODDetector(
+    (
+        set(getattr(sentiment_analyzer.analyzer, "lexicon", {}))
+        | set(BOOSTER_DICT)
+        | set(NEGATE)
+    ),
+    configured_unknown_token_ratio(),
+)
 
 # Import and register routers
 from src.api.ingestion_quality_routes import router as ingestion_quality_router
@@ -288,11 +304,14 @@ class AnalyzeRequest(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    sentiment: float  # compound_score from SentimentResult
+    sentiment: Optional[float]  # None when the input was not scored
     asset_codes: List[str] = []  # Asset codes found in text
     sentiment_label: str = ""  # positive/negative/neutral
     indicator: Optional[SentimentIndicatorResponse] = None  # Visual colour indicator
     explanation: Optional[SentimentExplanationResponse] = None  # Token attribution (#1456)
+    scored: bool = True
+    confidence: float = 1.0  # Lexical support; not a calibrated probability
+    status: str = "scored"
 
 
 class AssetAnalysisResponse(BaseModel):
@@ -611,6 +630,24 @@ async def analyze_text(body: AnalyzeRequest, request: Request) -> AnalyzeRespons
         if not body.text or not body.text.strip():
             raise HTTPException(status_code=400, detail="Text cannot be empty")
 
+        INFERENCE_REQUESTS_TOTAL.labels(endpoint="/analyze").inc()
+        assessment = ood_detector.assess(body.text)
+        if assessment.is_out_of_distribution:
+            INFERENCE_OOD_TOTAL.labels(endpoint="/analyze").inc()
+            logger.info(
+                "Rejected out-of-distribution input before sentiment inference "
+                "| unknown_token_ratio=%.4f | client_ip=%s",
+                assessment.unknown_token_ratio,
+                request.client.host,
+            )
+            return AnalyzeResponse(
+                sentiment=None,
+                sentiment_label="unscored",
+                scored=False,
+                confidence=assessment.confidence,
+                status="out_of_distribution",
+            )
+
         # Use your existing SentimentAnalyzer with asset filter
         result = sentiment_analyzer.analyze(
             body.text, body.asset, explain=body.explain
@@ -649,6 +686,9 @@ async def analyze_text(body: AnalyzeRequest, request: Request) -> AnalyzeRespons
                 if result.explanation
                 else None
             ),
+            scored=True,
+            confidence=assessment.confidence,
+            status="scored",
         )
 
     except HTTPException:
@@ -760,22 +800,60 @@ async def analyze_batch(request: Request, texts: list[str], asset: Optional[str]
         loop = asyncio.get_running_loop()
 
         def _run_batch() -> list:
-            return sentiment_analyzer.analyze_batch(texts, asset)
+            assessments = [ood_detector.assess(text) for text in texts]
+            for assessment in assessments:
+                INFERENCE_REQUESTS_TOTAL.labels(endpoint="/analyze-batch").inc()
+                if assessment.is_out_of_distribution:
+                    INFERENCE_OOD_TOTAL.labels(endpoint="/analyze-batch").inc()
+
+            in_distribution_texts = [
+                text
+                for text, assessment in zip(texts, assessments)
+                if not assessment.is_out_of_distribution
+            ]
+            scored_results = iter(
+                sentiment_analyzer.analyze_batch(in_distribution_texts, asset)
+            )
+            return [
+                (
+                    assessment,
+                    None
+                    if assessment.is_out_of_distribution
+                    else next(scored_results),
+                )
+                for assessment in assessments
+            ]
 
         try:
-            results = await loop.run_in_executor(_batch_executor, _run_batch)
+            assessed_results = await loop.run_in_executor(_batch_executor, _run_batch)
         except Exception as e:
             logger.error("Batch inference failed: %s", e, exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
         # --- 4. Per-item error isolation ---------------------------------------
         item_results: list[Dict[str, Any]] = []
-        for idx, (text, result) in enumerate(zip(texts, results)):
+        for idx, (text, (assessment, result)) in enumerate(zip(texts, assessed_results)):
+            if assessment.is_out_of_distribution:
+                item_results.append(
+                    {
+                        "index": idx,
+                        "text": text[:100],
+                        "status": "out_of_distribution",
+                        "scored": False,
+                        "confidence": assessment.confidence,
+                        "sentiment": None,
+                        "sentiment_label": "unscored",
+                        "asset_codes": [],
+                    }
+                )
+                continue
             try:
                 item_results.append({
                     "index": idx,
                     "text": text[:100],
                     "status": "ok",
+                    "scored": True,
+                    "confidence": assessment.confidence,
                     **result.to_dict(),
                 })
             except Exception as item_exc:
@@ -809,7 +887,11 @@ async def analyze_batch(request: Request, texts: list[str], asset: Optional[str]
                 )
 
         # Recompute summary from successful items only
-        successful = [r for r in results if r is not None]
+        successful = [
+            result
+            for assessment, result in assessed_results
+            if not assessment.is_out_of_distribution and result is not None
+        ]
         summary = sentiment_analyzer.get_sentiment_summary(successful) if successful else {}
 
         return {
